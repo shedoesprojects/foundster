@@ -1,0 +1,17 @@
+# Core data + ML
+pandas>=2.2,<4.0
+numpy>=1.26,<3.0
+scikit-learn>=1.5,<2.0
+pyod>=2.0,<4.0
+xgboost>=2.0,<4.0
+
+# API layer (next step -- wrapping the detector as a runnable service)
+fastapi>=0.110
+uvicorn>=0.29
+
+# Optional: minimal dashboard for the demo video (see UI recommendation)
+streamlit>=1.35
+
+# Dev / notebook use
+jupyter>=1.0
+matplotlib>=3.8

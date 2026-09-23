@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+venv/
+.venv/
+
+# Large v2 datasets
+fraud-detector-v2/data/fraudTest.csv
+fraud-detector-v2/data/fraudTrain.csv
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/

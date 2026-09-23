@@ -1,0 +1,111 @@
+"""
+generate_data.py
+
+Synthetic payment-transaction stream generator with injected fraud spikes.
+
+WHY THIS DESIGN (read this before you touch the code):
+
+1. Transactions belong to MERCHANTS, and each merchant has its own baseline
+   behavior (avg transaction size, typical hourly volume, home geography).
+   Real fraud detection is almost always merchant-relative -- a spike is
+   defined against a merchant's own history, not a global threshold.
+
+2. We inject three distinct fraud PATTERNS, not a single "is_fraud" coin flip:
+     - VELOCITY_SPIKE: a burst of transactions in a short time window
+       (e.g. compromised card testing many small amounts fast)
+     - AMOUNT_ANOMALY: a transaction far outside the merchant's normal
+       amount distribution
+     - GEO_DEVICE_ANOMALY: a transaction from a new device/location combo
+       that doesn't match the merchant's or customer's history
+
+   This matters because a single flat "fraud" label lets a model cheat by
+   learning one trivial threshold. Multiple patterns force real feature
+   engineering and give you separate precision/recall per pattern type,
+   which is exactly the kind of "honest metrics" the judges asked for.
+
+3. Data is generated as an ORDERED EVENT STREAM (sorted by timestamp), not
+   a shuffled table. This is what lets you compute rolling/velocity
+   features later, which is where most of the real signal lives.
+
+Output: data/transactions.csv with columns:
+  txn_id, merchant_id, customer_id, timestamp, amount, device_id,
+  geo_lat, geo_lon, is_fraud, fraud_type (empty if legit)
+"""
+
+"""
+features.py
+
+Feature engineering for the fraud-spike detector.
+
+WHY THESE FEATURES (and why order matters):
+
+Raw columns (amount, device_id, geo) can't separate fraud from legitimate
+behavior on their own -- a Rs 5000 transaction is nothing for one merchant
+and a huge outlier for another. Every feature below is MERCHANT-RELATIVE
+or WINDOW-RELATIVE, computed only from data available *before* that
+transaction (no leakage from the future).
+
+Features built:
+  1. amount_zscore        -- how unusual is this amount vs merchant's rolling mean/std
+  2. txn_count_5min        -- velocity: transactions for this merchant in trailing 5 min
+  3. unique_devices_5min   -- how many distinct devices hit this merchant in trailing 5 min
+  4. is_new_device         -- has this device ever transacted with this merchant before
+  5. geo_dist_from_home    -- distance (degrees, proxy for km) from merchant's home location
+
+IMPORTANT: we compute rolling stats using only PAST transactions (shift by 1
+before rolling) -- if you don't do this, you leak the current (possibly
+fraudulent) transaction into its own baseline stats and everything looks
+artificially "normal". This is one of the most common and hardest-to-spot
+bugs in fraud/anomaly detection pipelines -- worth calling out explicitly
+in your "what broke" section.
+"""
+
+"""
+models.py
+
+Three detectors, compared honestly on the same held-out test set.
+
+WHY THREE MODELS:
+  1. RULE-BASED BASELINE -- simple thresholds on our engineered features.
+     Every real detection project needs this: if your fancy model can't
+     beat simple rules, the fancy model isn't earning its complexity.
+
+  2. ISOLATION FOREST (unsupervised, via PyOD) -- realistic production
+     scenario. We do NOT show it fraud labels during training. This is
+     what you'd actually deploy on day 1 before you've accumulated
+     enough confirmed fraud cases to train a supervised model.
+
+  3. XGBOOST (supervised) -- trained WITH labels. This is the ceiling:
+     "if we had reliable labels, here's the best achievable performance."
+     The gap between this and Isolation Forest is itself the finding to
+     report -- it quantifies the cost of not having labels yet.
+
+TRAIN/TEST SPLIT: split by TIME, not randomly. We train on the first 10
+days and test on the last 4 days. Random splits leak future information
+into training (a transaction's rolling features were computed using data
+that, in a random split, could come from "after" it in the test set's
+frame) and would make every score look artificially better than reality.
+This is the second most common leakage bug in this kind of project.
+"""
+What does each file do, and why (walking through the logic)
+
+generate_data.py — creates a fake but realistic world. 25 merchants, 2000 customers, 14 days of transactions. Every merchant has its own "normal" (average amount, transaction volume, home location). Then it deliberately injects 3 kinds of fraud into that normal stream — a burst of transactions (velocity_spike), one absurdly large transaction (amount_anomaly), or a transaction from a location/device that doesn't fit (geo_device_anomaly). This exists because there's no real transaction data we're allowed to use — so we build a fake world where we know the ground truth, so we can grade our detector against it later.
+
+features.py — raw columns like amount or device_id mean nothing to a model on their own. This file turns each transaction into 5 numbers that describe "how weird is this, relative to what's normal for this merchant":
+
+amount_zscore — how many standard deviations away from this merchant's usual amount
+txn_count_5min — how many transactions just happened for this merchant (velocity)
+unique_devices_5min — how many different devices, in that same window
+is_new_device — has this device ever paid this merchant before
+geo_dist_from_home — how far from the merchant's usual location
+
+The critical design choice here (worth remembering, it's a common bug): every one of these is computed using only past data relative to each transaction — never looking ahead. If you accidentally let a rolling average include the current (possibly fraudulent) transaction, your fraud detector inadvertently "normalizes itself" and becomes blind to the very thing it's trying to catch.
+
+models.py — takes those 5 features and tries 3 different detectors, then grades all of them fairly against the same test set:
+
+Rule-based baseline — simple hand-written thresholds (e.g. "flag if >8 txns in 5 min"). This is your control group.
+Isolation Forest — an unsupervised algorithm that never sees the is_fraud labels during training; it just learns what "normal" looks like and flags outliers. This is the realistic option for production, since you rarely have clean fraud labels in real life.
+XGBoost — a supervised model that does see the labels during training. This is your "if we had perfect labels" ceiling, for comparison.
+
+It then measures precision, recall, and — importantly — an estimated ₹ cost of each model's mistakes, because the task explicitly asked for false-positive cost, not just accuracy.
+
