@@ -11,6 +11,11 @@ venv/
 fraud-detector-v2/data/fraudTest.csv
 fraud-detector-v2/data/fraudTrain.csv
 
+# Generated V2 outputs
+fraud-detector-v2/data/features_train.csv
+fraud-detector-v2/data/features_test.csv
+fraud-detector-v2/data/model_comparison_real.csv
+
 # OS/editor files
 .DS_Store
 Thumbs.db

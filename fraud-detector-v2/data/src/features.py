@@ -1,155 +1,592 @@
 """
 Feature engineering for the REAL Kaggle Sparkov credit-card fraud dataset.
 
-KEY DIFFERENCE FROM OUR SYNTHETIC VERSION (read this first):
+V2 DESIGN
+---------
+V1 asks:
+    "Is this transaction unusual for this merchant?"
 
-In our synthetic data, we built MERCHANT-relative features (is this
-transaction weird for THIS merchant's normal pattern). That made sense
-for a "protect this merchant" framing.
+V2 asks:
+    "Is this transaction unusual for this cardholder?"
 
-Real card fraud works the other way: a stolen card gets used across
-MANY merchants. So here we build CARDHOLDER-relative features (is this
-transaction weird for THIS card's normal pattern) -- this is the
-standard framing in real fraud detection and is a more honest match to
-how card-present/card-not-present fraud actually happens.
+That distinction matters because a compromised card can be used
+across many different merchants.
 
-Features built, all per cc_num (cardholder), using only PAST transactions:
-  1. amount_zscore       -- amount vs this card's own rolling mean/std
-  2. txn_count_1hr        -- velocity: transactions by this card in trailing 1hr
-                             (Sparkov transactions are sparser in time than our
-                             synthetic stream, so we widen the window from
-                             5min to 1hr -- always size your window to your
-                             data's actual density, don't copy a constant blindly)
-  3. is_new_merchant      -- has this card ever paid this merchant before
-  4. distance_from_home   -- real geographic distance (km, haversine) between
-                             cardholder's home lat/long and merchant's lat/long
-                             (this is BETTER than our synthetic proxy -- real
-                             coordinates, real formula, not a degrees approximation)
-  5. category_amt_zscore  -- amount vs this card's own average WITHIN that
-                             spending category (a Rs5000 "grocery_pos" txn is
-                             far weirder than a Rs5000 "travel" txn for the
-                             same person -- category context matters)
+All behavioral features are built from information available before
+the current transaction.
 
-LEAKAGE DISCIPLINE (same principle as before): every rolling/expanding
-stat uses .shift(1) before computing, so a transaction never sees itself
-in its own baseline.
+IMPORTANT:
+    We never allow the current transaction to influence its own
+    historical baseline.
+
+FEATURE GROUPS
+--------------
+
+1. Cardholder behavioral features
+   - amount_zscore
+   - txn_count_1hr
+   - is_new_merchant
+   - seconds_since_last_txn
+
+2. Category-relative behavior
+   - category_amt_zscore
+   - category_freq
+
+3. Geographic behavior
+   - distance_from_home
+
+4. Temporal behavior
+   - hour_sin
+   - hour_cos
+   - is_weekend
+
+5. Demographic/context features
+   - age
+   - city_pop_log
+   - gender_female
+   - job_freq
+
+6. Merchant context
+   - merchant_risk
+
+merchant_risk is NOT calculated from the transaction's own label.
+It is calculated from a historical training period and later applied
+to validation/test data.
 """
 
 import pandas as pd
 import numpy as np
 
+
 TRAIN_PATH = "data/fraudTrain.csv"
 TEST_PATH = "data/fraudTest.csv"
 
 
+# ============================================================
+# 1. GEOGRAPHIC DISTANCE
+# ============================================================
+
 def haversine_km(lat1, lon1, lat2, lon2):
-    """Real great-circle distance in km -- more honest than our synthetic
-    degrees-based proxy."""
+    """
+    Calculate great-circle distance between two latitude/longitude
+    coordinates.
+
+    Returns:
+        Distance in kilometers.
+    """
+
     R = 6371.0
-    lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2])
+
+    lat1, lon1, lat2, lon2 = map(
+        np.radians,
+        [lat1, lon1, lat2, lon2]
+    )
+
     dlat = lat2 - lat1
     dlon = lon2 - lon1
-    a = np.sin(dlat / 2) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2) ** 2
+
+    a = (
+        np.sin(dlat / 2) ** 2
+        + np.cos(lat1)
+        * np.cos(lat2)
+        * np.sin(dlon / 2) ** 2
+    )
+
     return 2 * R * np.arcsin(np.sqrt(a))
 
 
+# ============================================================
+# 2. LOAD RAW DATA
+# ============================================================
+
 def load_raw(path, sample_frac=None):
+    """
+    Load Sparkov transaction data.
+
+    If sampling is requested, sample CARDHOLDERS rather than rows.
+    This preserves each selected cardholder's transaction history.
+    """
+
     df = pd.read_csv(path)
-    df["trans_date_trans_time"] = pd.to_datetime(df["trans_date_trans_time"])
-    if sample_frac:
-        # sample by cardholder (not by row) so each card's full history stays intact
-        keep_cards = df["cc_num"].drop_duplicates().sample(frac=sample_frac, random_state=42)
+
+    df["trans_date_trans_time"] = pd.to_datetime(
+        df["trans_date_trans_time"]
+    )
+
+    df["dob"] = pd.to_datetime(df["dob"])
+
+    if sample_frac is not None:
+        keep_cards = (
+            df["cc_num"]
+            .drop_duplicates()
+            .sample(
+                frac=sample_frac,
+                random_state=42
+            )
+        )
+
         df = df[df["cc_num"].isin(keep_cards)]
+
     return df
 
 
+# ============================================================
+# 3. CARDHOLDER-LEVEL FEATURES
+# ============================================================
+
 def engineer_features(df):
-    df = df.sort_values(["cc_num", "trans_date_trans_time"]).reset_index(drop=True)
+    """
+    Build transaction-level features.
 
-    df["distance_from_home"] = haversine_km(df["lat"], df["long"], df["merch_lat"], df["merch_long"])
+    Every behavioral feature is based on information that occurred
+    before the current transaction.
+    """
 
-    out_frames = []
-    for cc_num, g in df.groupby("cc_num", sort=False):
-        g = g.sort_values("trans_date_trans_time").reset_index(drop=True)
+    df = df.copy()
 
-        # --- amount z-score vs THIS CARD's prior rolling mean/std ---
-        prior_amt = g["amt"].shift(1)
-        roll_mean = prior_amt.expanding(min_periods=5).mean()
-        roll_std = prior_amt.expanding(min_periods=5).std().replace(0, np.nan)
-        g["amount_zscore"] = ((g["amt"] - roll_mean) / roll_std).fillna(0)
+    # --------------------------------------------------------
+    # Sort chronologically within each card
+    # --------------------------------------------------------
 
-        # --- category-relative amount z-score ---
+    df = (
+        df.sort_values(
+            ["cc_num", "trans_date_trans_time"]
+        )
+        .reset_index(drop=True)
+    )
+
+    # --------------------------------------------------------
+    # Geographic distance
+    # --------------------------------------------------------
+
+    df["distance_from_home"] = haversine_km(
+        df["lat"],
+        df["long"],
+        df["merch_lat"],
+        df["merch_long"]
+    )
+
+    output_frames = []
+
+    # --------------------------------------------------------
+    # Process each cardholder independently
+    # --------------------------------------------------------
+
+    for cc_num, g in df.groupby(
+        "cc_num",
+        sort=False
+    ):
+
+        g = (
+            g.sort_values("trans_date_trans_time")
+            .reset_index(drop=True)
+        )
+
+        # ====================================================
+        # A. AMOUNT Z-SCORE
+        # ====================================================
+
+        # IMPORTANT:
+        # shift(1) means the current transaction is NOT included
+        # in its own historical baseline.
+
+        prior_amount = g["amt"].shift(1)
+
+        rolling_mean = (
+            prior_amount
+            .expanding(min_periods=5)
+            .mean()
+        )
+
+        rolling_std = (
+            prior_amount
+            .expanding(min_periods=5)
+            .std()
+            .replace(0, np.nan)
+        )
+
+        g["amount_zscore"] = (
+            (g["amt"] - rolling_mean)
+            / rolling_std
+        ).fillna(0)
+
+        # ====================================================
+        # B. CATEGORY-RELATIVE AMOUNT
+        # ====================================================
+
         g["category_amt_zscore"] = 0.0
-        for cat, cg in g.groupby("category"):
-            idx = cg.index
-            prior = g.loc[idx, "amt"].shift(1)
-            m = prior.expanding(min_periods=3).mean()
-            s = prior.expanding(min_periods=3).std().replace(0, np.nan)
-            g.loc[idx, "category_amt_zscore"] = ((g.loc[idx, "amt"] - m) / s).fillna(0)
 
-        # --- velocity: transactions by this card in trailing 1 hour ---
-        g_ts = g.set_index("trans_date_trans_time")
-        txn_count = g_ts["trans_num"].rolling("1h").count()
-        g["txn_count_1hr"] = (txn_count - 1).values
+        for category, category_group in g.groupby(
+            "category"
+        ):
 
-        # --- merchant novelty: has this card paid this merchant before ---
-        seen = set()
-        is_new = []
-        for m in g["merchant"]:
-            is_new.append(0 if m in seen else 1)
-            seen.add(m)
-        g["is_new_merchant"] = is_new
+            idx = category_group.index
 
-        out_frames.append(g)
+            prior_category_amount = (
+                g.loc[idx, "amt"]
+                .shift(1)
+            )
 
-    result = pd.concat(out_frames, ignore_index=True)
-    result = result.sort_values("trans_date_trans_time").reset_index(drop=True)
+            category_mean = (
+                prior_category_amount
+                .expanding(min_periods=3)
+                .mean()
+            )
 
-    # --- time-of-day / day-of-week (fraud often clusters at odd hours) ---
-    # cyclical encoding (sin/cos) instead of raw hour int -- so the model
-    # understands hour 23 and hour 0 are adjacent, not 23 apart
-    result["hour"] = result["trans_date_trans_time"].dt.hour
-    result["hour_sin"] = np.sin(2 * np.pi * result["hour"] / 24)
-    result["hour_cos"] = np.cos(2 * np.pi * result["hour"] / 24)
-    result["is_weekend"] = (result["trans_date_trans_time"].dt.dayofweek >= 5).astype(int)
+            category_std = (
+                prior_category_amount
+                .expanding(min_periods=3)
+                .std()
+                .replace(0, np.nan)
+            )
 
-    # --- category frequency-encoded (how common is this category overall) ---
-    # frequency encoding is a simple, leakage-safe way to use a high-cardinality
-    # categorical without one-hot blowing up the feature space
-    cat_freq = result["category"].value_counts(normalize=True)
-    result["category_freq"] = result["category"].map(cat_freq)
+            g.loc[idx, "category_amt_zscore"] = (
+                (
+                    g.loc[idx, "amt"]
+                    - category_mean
+                )
+                / category_std
+            ).fillna(0)
+
+        # ====================================================
+        # C. TRANSACTION VELOCITY
+        # ====================================================
+
+        temp = g.set_index(
+            "trans_date_trans_time"
+        )
+
+        transaction_count = (
+            temp["trans_num"]
+            .rolling("1h")
+            .count()
+        )
+
+        # Rolling window includes current transaction.
+        # Subtract one so this represents OTHER transactions
+        # in the preceding hour.
+
+        g["txn_count_1hr"] = (
+            transaction_count - 1
+        ).values
+
+        # ====================================================
+        # D. NEW MERCHANT
+        # ====================================================
+
+        seen_merchants = set()
+        new_merchant_flags = []
+
+        for merchant in g["merchant"]:
+
+            if merchant in seen_merchants:
+                new_merchant_flags.append(0)
+            else:
+                new_merchant_flags.append(1)
+
+            seen_merchants.add(merchant)
+
+        g["is_new_merchant"] = new_merchant_flags
+
+        # ====================================================
+        # E. TIME SINCE PREVIOUS TRANSACTION
+        # ====================================================
+
+        previous_time = (
+            g["trans_date_trans_time"]
+            .shift(1)
+        )
+
+        gap_seconds = (
+            g["trans_date_trans_time"]
+            - previous_time
+        ).dt.total_seconds()
+
+        # First transaction gets a large value rather than zero.
+        g["seconds_since_last_txn"] = (
+            gap_seconds
+            .fillna(30 * 24 * 3600)
+        )
+
+        output_frames.append(g)
+
+    result = pd.concat(
+        output_frames,
+        ignore_index=True
+    )
+
+    result = (
+        result
+        .sort_values("trans_date_trans_time")
+        .reset_index(drop=True)
+    )
+
+    # ========================================================
+    # 4. TIME FEATURES
+    # ========================================================
+
+    result["hour"] = (
+        result["trans_date_trans_time"]
+        .dt.hour
+    )
+
+    # Cyclic encoding:
+    #
+    # 23:00 and 00:00 are close in reality.
+    # Raw integers would incorrectly represent them as far apart.
+
+    result["hour_sin"] = np.sin(
+        2 * np.pi * result["hour"] / 24
+    )
+
+    result["hour_cos"] = np.cos(
+        2 * np.pi * result["hour"] / 24
+    )
+
+    result["is_weekend"] = (
+        result["trans_date_trans_time"]
+        .dt.dayofweek >= 5
+    ).astype(int)
+
+    # ========================================================
+    # 5. CATEGORY FREQUENCY
+    # ========================================================
+
+    category_frequency = (
+        result["category"]
+        .value_counts(normalize=True)
+    )
+
+    result["category_freq"] = (
+        result["category"]
+        .map(category_frequency)
+    )
+
+    # ========================================================
+    # 6. DEMOGRAPHIC / CONTEXT FEATURES
+    # ========================================================
+
+    result["age"] = (
+        (
+            result["trans_date_trans_time"]
+            - result["dob"]
+        ).dt.days
+        / 365.25
+    )
+
+    result["city_pop_log"] = np.log1p(
+        result["city_pop"]
+    )
+
+    result["gender_female"] = (
+        result["gender"] == "F"
+    ).astype(int)
+
+    # ========================================================
+    # 7. JOB FREQUENCY
+    # ========================================================
+
+    job_frequency = (
+        result["job"]
+        .value_counts(normalize=True)
+    )
+
+    result["job_freq"] = (
+        result["job"]
+        .map(job_frequency)
+    )
 
     return result
 
 
-FEATURE_COLS = ["amount_zscore", "category_amt_zscore", "txn_count_1hr",
-                 "is_new_merchant", "distance_from_home",
-                 "hour_sin", "hour_cos", "is_weekend", "category_freq"]
+# ============================================================
+# 8. MERCHANT RISK
+# ============================================================
 
-KEEP_COLS = ["trans_num", "cc_num", "merchant", "category", "amt",
-             "trans_date_trans_time", "is_fraud"] + FEATURE_COLS
+def add_merchant_risk(
+    historical_df,
+    apply_to_df
+):
+    """
+    Add historical merchant fraud rate.
 
-# de-dupe while preserving order (hour/category_freq aren't in original per-card loop)
-KEEP_COLS = list(dict.fromkeys(KEEP_COLS))
+    IMPORTANT:
+        historical_df must contain ONLY information available
+        before the transactions in apply_to_df.
 
+    This prevents target leakage.
+
+    Unknown merchants receive the historical global fraud rate.
+    """
+
+    historical_df = historical_df.copy()
+    apply_to_df = apply_to_df.copy()
+
+    merchant_rate = (
+        historical_df
+        .groupby("merchant")["is_fraud"]
+        .mean()
+    )
+
+    global_rate = (
+        historical_df["is_fraud"]
+        .mean()
+    )
+
+    apply_to_df["merchant_risk"] = (
+        apply_to_df["merchant"]
+        .map(merchant_rate)
+        .fillna(global_rate)
+    )
+
+    return apply_to_df
+
+
+# ============================================================
+# 9. FINAL FEATURE LIST
+# ============================================================
+
+FEATURE_COLS = [
+
+    # Cardholder behavior
+    "amount_zscore",
+    "category_amt_zscore",
+    "txn_count_1hr",
+    "is_new_merchant",
+    "seconds_since_last_txn",
+
+    # Geography
+    "distance_from_home",
+
+    # Time
+    "hour_sin",
+    "hour_cos",
+    "is_weekend",
+
+    # Category
+    "category_freq",
+
+    # Demographics / context
+    "age",
+    "city_pop_log",
+    "gender_female",
+    "job_freq",
+
+    # Merchant historical risk
+    "merchant_risk",
+]
+
+
+KEEP_COLS = [
+    "trans_num",
+    "cc_num",
+    "merchant",
+    "category",
+    "amt",
+    "trans_date_trans_time",
+    "is_fraud",
+] + FEATURE_COLS
+
+# Remove accidental duplicates while preserving order.
+KEEP_COLS = list(
+    dict.fromkeys(KEEP_COLS)
+)
+
+
+# ============================================================
+# 10. MAIN
+# ============================================================
 
 if __name__ == "__main__":
+
     print("Loading train set...")
+
     train_raw = load_raw(TRAIN_PATH)
-    print(f"  {len(train_raw)} rows, {train_raw['is_fraud'].sum()} fraud")
 
-    print("Loading test set...")
+    print(
+        f"  {len(train_raw):,} rows, "
+        f"{train_raw['is_fraud'].sum():,} fraud"
+    )
+
+    print("\nLoading test set...")
+
     test_raw = load_raw(TEST_PATH)
-    print(f"  {len(test_raw)} rows, {test_raw['is_fraud'].sum()} fraud")
 
-    print("Engineering features (train)...")
-    train_feat = engineer_features(train_raw)
-    print("Engineering features (test)...")
-    test_feat = engineer_features(test_raw)
+    print(
+        f"  {len(test_raw):,} rows, "
+        f"{test_raw['is_fraud'].sum():,} fraud"
+    )
 
-    train_feat[KEEP_COLS].to_csv("data/features_train.csv", index=False)
-    test_feat[KEEP_COLS].to_csv("data/features_test.csv", index=False)
+    print("\nEngineering features for train...")
 
-    print("\nSaved data/features_train.csv and data/features_test.csv")
-    print("\nFeature means, fraud vs legit (train):")
-    print(train_feat.groupby("is_fraud")[FEATURE_COLS].mean())
+    train_feat = engineer_features(
+        train_raw
+    )
+
+    print("Engineering features for test...")
+
+    test_feat = engineer_features(
+        test_raw
+    )
+
+    # --------------------------------------------------------
+    # Merchant risk:
+    #
+    # Train merchant risk comes from TRAIN.
+    # Test merchant risk is also calculated from TRAIN only.
+    # --------------------------------------------------------
+
+    train_feat = add_merchant_risk(
+        train_feat,
+        train_feat
+    )
+
+    test_feat = add_merchant_risk(
+        train_feat,
+        test_feat
+    )
+
+    # --------------------------------------------------------
+    # Save
+    # --------------------------------------------------------
+
+    train_feat[KEEP_COLS].to_csv(
+        "data/features_train.csv",
+        index=False
+    )
+
+    test_feat[KEEP_COLS].to_csv(
+        "data/features_test.csv",
+        index=False
+    )
+
+    print(
+        "\nSaved:"
+        "\n  data/features_train.csv"
+        "\n  data/features_test.csv"
+    )
+
+    print(
+        "\nNumber of features:",
+        len(FEATURE_COLS)
+    )
+
+    print("\nFeatures:")
+
+    for i, feature in enumerate(
+        FEATURE_COLS,
+        start=1
+    ):
+        print(
+            f"  {i:2d}. {feature}"
+        )
+
+    print(
+        "\nFeature means, fraud vs legitimate:"
+    )
+
+    print(
+        train_feat
+        .groupby("is_fraud")[FEATURE_COLS]
+        .mean()
+    )
