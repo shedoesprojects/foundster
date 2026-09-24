@@ -20,3 +20,7 @@ fraud-detector-v2/data/model_comparison_real.csv
 .DS_Store
 Thumbs.db
 .vscode/
+
+# Credit-card branch datasets
+credit-card-fraud/data/
+credit-card-fraud/**/__pycache__/
